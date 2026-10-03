@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Observer</title>
+<!--
+  Noon Qalam - Observer - capture page (pilot/observer/capture/). DESIGN.md section 3.
+  Opens at login on the classroom machine, records the USB desk mic on the campus timetable in 20-minute Opus chunks,
+  measures the sound level every 10 s, and uploads to the Apps Script endpoint. No framework, no build step, no key,
+  no name, no data in this file. The one secret, the device token, arrives in the startup URL once and stays in
+  localStorage on this machine. Invariant 1: nothing here is for a child, parent or facilitator to read; the page
+  shows a state word and a mic name so an HQ person can check it at setup and on a visit.
+-->
+<style>
+  :root { --ink:#111; --sec:#6B6B6B; --rule:#E6E6E6; --chip:#F2F2F2; --green:#0B3D2E; --amber:#B8860B; --red:#B00020; --blue:#1F3A93; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:#fff; color:var(--ink); font:15px/1.5 -apple-system,"SF Pro Text","Segoe UI","Helvetica Neue",Helvetica,sans-serif; }
+  header { height:64px; border-bottom:1px solid var(--rule); display:flex; align-items:center; gap:16px; padding:0 24px; }
+  .mark { font-weight:700; font-size:20px; color:#fff; padding:6px 12px; }
+  .mark.qalam { background:#111; } .mark.observer { background:var(--blue); }
+  header .sub { color:var(--sec); font-size:14px; margin-left:auto; }
+  main { max-width:760px; margin:0 auto; padding:24px 16px 48px; }
+  .state { font-size:32px; font-weight:700; margin:8px 0 4px; }
+  .state.recording { color:var(--green); } .state.waiting { color:var(--sec); } .state.no_mic, .state.error { color:var(--red); }
+  .lead { color:var(--sec); margin:0 0 20px; }
+  section { border:1px solid var(--rule); border-radius:10px; padding:18px 20px; margin-bottom:16px; }
+  section h2 { font-size:12px; font-weight:600; letter-spacing:.04em; color:var(--sec); text-transform:uppercase; margin:0 0 12px; }
+  dl { display:grid; grid-template-columns:200px 1fr; gap:6px 16px; margin:0; font-size:14px; }
+  dt { color:var(--sec); } dd { margin:0; word-break:break-word; }
+  .meter { height:14px; border:1px solid var(--rule); border-radius:10px; overflow:hidden; }
+  .meter > div { height:100%; width:0; background:var(--green); transition:width .2s linear; }
+  .ok { color:var(--green); font-weight:600; } .warn { color:var(--amber); font-weight:600; } .bad { color:var(--red); font-weight:600; }
+  button { height:40px; padding:0 16px; border-radius:10px; font-size:14px; font-weight:600; cursor:pointer; border:1px solid var(--rule); background:#fff; color:var(--green); }
+  button.primary { background:var(--green); color:#fff; border-color:var(--green); }
+  .setup { display:none; }
+  body.needs-setup .setup { display:block; }
+  pre { background:var(--chip); border-radius:10px; padding:12px; font-size:12px; white-space:pre-wrap; max-height:220px; overflow:auto; }
+  .note { color:var(--sec); font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <span class="mark qalam">Qalam</span>
+  <span class="mark observer">Observer</span>
+  <span class="sub" id="pageVersion"></span>
+</header>
+<main>
+  <div class="state waiting" id="stateWord">Starting</div>
+  <p class="lead" id="stateDetail">Reading the schedule.</p>
+
+  <section class="setup">
+    <h2>Setup needed</h2>
+    <p id="setupText">This machine has no device id. Open the startup address HQ gave you, the one with <code>?device=</code> and <code>&amp;token=</code>, once.</p>
+    <div><button id="btnAllow" class="primary">Allow microphone</button> <span class="note">Chrome asks once; choose Allow. The page then picks the USB mic by itself.</span></div>
+  </section>
+
+  <section>
+    <h2>Microphone</h2>
+    <dl>
+      <dt>Device</dt><dd id="micLabel">–</dd>
+      <dt>Chosen by</dt><dd id="micHow">–</dd>
+      <dt>Level (relative)</dt><dd><div class="meter"><div id="meterBar"></div></div></dd>
+    </dl>
+  </section>
+
+  <section>
+    <h2>Today</h2>
+    <dl>
+      <dt>Device id</dt><dd id="deviceId">–</dd>
+      <dt>Campus</dt><dd id="campus">–</dd>
+      <dt>Schedule</dt><dd id="schedule">–</dd>
+      <dt>Session</dt><dd id="session">–</dd>
+      <dt>Current chunk</dt><dd id="chunk">–</dd>
+      <dt>Waiting to upload</dt><dd id="queue">–</dd>
+      <dt>Last upload</dt><dd id="lastUpload">–</dd>
+    </dl>
+  </section>
+
+  <section>
+    <h2>Log</h2>
+    <pre id="log"></pre>
+  </section>
+</main>
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
