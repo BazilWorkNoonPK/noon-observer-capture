@@ -1,7 +1,7 @@
 // Observer capture page - configuration. Plain constants; no secrets. Every number here is PROVISIONAL
 // (observer/CLAUDE.md rule 6) and is reported in the pilot report. Decisions: Noon_Qalam_Decisions_2026-09-24_Observer.md.
 window.OBS_CONFIG = {
-  PAGE_VERSION: 'capture@0.1.0',
+  PAGE_VERSION: 'capture@0.1.1',
 
   // Where chunks, levels and status go. The Apps Script web app URL (endpoint/README.md). Set at deploy time.
   ENDPOINT_URL: 'https://script.google.com/macros/s/AKfycby2SsJmqh99krANRgVxgte3EN2sPTFUi3o3fLhfiMGkCbnvwBg2atMij0L2S4EbQczZ/exec',   // deployed 3 October 2026, Observer endpoint v1

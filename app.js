@@ -11,7 +11,7 @@
     schedule: null, scheduleFetchedAt: 0, scheduleSource: 'none',
     stream: null, track: null, micLabel: null, micHow: null, micDeviceId: null, micLost: false, reopenTimer: null,
     ctx: null, dest: null, ctxRunning: false,
-    rec: null, recStream: null, chunks: [], chunkStartMs: 0, chunkSeq: 0, stopping: false, stopReason: null,
+    rec: null, cur: null, chunkStartMs: 0, chunkSeq: 0, stopping: false, starting: false,
     session: null,                      // { id, shift, cohort_code, periods, startedAt }
     levels: [], levelsSeq: 0, lastLevelsFlush: 0, lastStatus: 0, lastTick: 0,
     inFlight: false, lastUpload: null, queueDepth: 0, queueBytes: 0,
@@ -27,7 +27,7 @@
   function setState(word, detail) {
     S.state = word; S.detail = detail || '';
     const el = $('stateWord'); el.className = 'state ' + word;
-    el.textContent = { recording: 'Recording', waiting: 'Waiting for shift', no_mic: 'No USB mic', error: 'Error', starting: 'Starting' }[word] || word;
+    el.textContent = { recording: 'Recording', waiting: 'Waiting for shift', no_mic: 'No USB mic', error: 'Error', starting: 'Starting', standby: 'Standby' }[word] || word;
     $('stateDetail').textContent = S.detail;
   }
   function render() {
@@ -36,7 +36,7 @@
     $('campus').textContent = (S.schedule && S.schedule.campus_name) || '–';
     $('schedule').textContent = S.schedule ? S.schedule.shifts.map(s => `shift ${s.shift} ${s.start}–${s.end}${s.cohort_code ? ' ' + s.cohort_code : ''}`).join(' · ') + ` (${S.scheduleSource})` : '–';
     $('session').textContent = S.session ? S.session.id : '–';
-    $('chunk').textContent = S.rec && S.rec.state === 'recording' ? `#${S.chunkSeq} since ${new Date(S.chunkStartMs).toTimeString().slice(0, 8)}` : '–';
+    $('chunk').textContent = S.cur && S.cur.rec.state === 'recording' ? `#${S.cur.seq} since ${new Date(S.cur.startMs).toTimeString().slice(0, 8)}` : '–';
     $('queue').textContent = `${S.queueDepth} items, ${(S.queueBytes / 1024 / 1024).toFixed(1)} MB`;
     $('lastUpload').textContent = S.lastUpload || 'none yet';
     $('micLabel').textContent = S.micLabel || '–';
@@ -57,7 +57,8 @@
   // ?fake=1 (with ?test=): a synthetic source instead of the mic (a 440 Hz tone, soft noise and a deliberate 50 Hz hum),
   // so the recording path and the high-pass filter can be checked on a machine with no microphone at all.
   // The endpoint: config.js, or the local stand-in (observer/tools/local_endpoint.py) when the page is served from localhost.
-  const ENDPOINT = (/^REPLACE/.test(C.ENDPOINT_URL) && /^(127\.0\.0\.1|localhost)$/.test(location.hostname)) ? location.origin + '/api' : C.ENDPOINT_URL;
+  // Served from this machine, the page always talks to the local stand-in, never to Noon's real endpoint.
+  const ENDPOINT = /^(127\.0\.0\.1|localhost)$/.test(location.hostname) ? location.origin + '/api' : C.ENDPOINT_URL;
 
   // ------------------------------------------------------------------ time (local wall clock with the configured offset)
   const offsetMin = (() => { const m = /([+-])(\d\d):(\d\d)/.exec(C.TIMEZONE_OFFSET); return (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3])); })();
@@ -80,8 +81,14 @@
   // ------------------------------------------------------------------ schedule (3.5)
   function defaultSchedule() {
     if (TEST) {
-      const a = localParts(TEST.startedAt).hm, b = localParts(TEST.startedAt + TEST.minutes * 60000).hm;
-      return { campus_name: 'TEST', timetabled: false, test: true, shifts: [{ shift: 1, start: a, end: b < a ? '23:59' : b, cohort_code: null, periods: [] }] };   // test sessions carry a T suffix in their id
+      // A test run is split into two back-to-back shifts, as a real day is (08:00-11:00 then 11:00-14:00), so the
+      // hand-over between shifts is exercised too (6 October 2026). Test sessions carry a T suffix in their id.
+      const hm = (min) => localParts(TEST.startedAt + min * 60000).hm;
+      const a = hm(0), m = hm(TEST.minutes / 2), b0 = hm(TEST.minutes), b = b0 < a ? '23:59' : b0;
+      const shifts = (m > a && m < b)
+        ? [{ shift: 1, start: a, end: m, cohort_code: null, periods: [] }, { shift: 2, start: m, end: b, cohort_code: null, periods: [] }]
+        : [{ shift: 1, start: a, end: b, cohort_code: null, periods: [] }];
+      return { campus_name: 'TEST', timetabled: false, test: true, shifts };
     }
     return { campus_name: null, timetabled: false, shifts: C.DEFAULT_SHIFTS.map(s => ({ ...s, cohort_code: null, periods: [] })) };
   }
@@ -202,47 +209,54 @@
     if (!S.levels.length) return;
     if (!force && Date.now() - S.lastLevelsFlush < C.LEVELS_BATCH_S * 1000) return;
     const rows = S.levels; S.levels = []; S.lastLevelsFlush = Date.now(); S.levelsSeq++;
+    saveSeq(S.session.id);
     enqueue({ kind: 'levels', id: `${S.session.id}_L${String(S.levelsSeq).padStart(4, '0')}`, session_id: S.session.id, rows });
   }
 
   // ------------------------------------------------------------------ chunks (3.4)
+  // Everything one chunk needs is captured in `cur` when it starts (6 October 2026). MediaRecorder delivers a stopped
+  // chunk a moment later, by which time the next chunk, or at 11:00 the next shift, may already have begun; reading
+  // shared state then mixed the two. The chunk's number is reserved at its start and kept across reloads, so a crash
+  // leaves a gap in the numbers and never reuses one.
   function startChunk() {
-    if (!S.stream || !S.session || S.micLost) return;
-    const useFiltered = S.ctxRunning && S.dest;
-    S.recStream = useFiltered ? S.dest.stream : S.stream;
+    if (!S.stream || !S.session || S.micLost || S.starting) return;
+    if (S.cur && S.cur.rec.state === 'recording') return;                      // one recorder at a time
+    const filtered = !!(S.ctxRunning && S.dest);
+    const stream = filtered ? S.dest.stream : S.stream;
     const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : '';
-    try { S.rec = new MediaRecorder(S.recStream, { mimeType: mime || undefined, audioBitsPerSecond: C.AUDIO_BITS_PER_SECOND }); }
+    let rec;
+    try { rec = new MediaRecorder(stream, { mimeType: mime || undefined, audioBitsPerSecond: C.AUDIO_BITS_PER_SECOND }); }
     catch (e) { log(`recorder failed: ${e.message}`); setState('error', `Cannot record: ${e.message}`); return; }
-    S.chunks = []; S.chunkStartMs = Date.now(); S.stopReason = null; S.recSession = S.session;   // the session this chunk belongs to, even after endSession()
-    S.rec.ondataavailable = (e) => { if (e.data && e.data.size) S.chunks.push(e.data); };
-    S.rec.onstop = () => finalizeChunk();
-    S.rec.start();
-    setState('recording', `${S.session.id} · chunk #${S.chunkSeq} · mic "${S.micLabel}"${useFiltered ? '' : ' · raw (no filter)'}`);
-    log(`chunk start #${S.chunkSeq} ${useFiltered ? 'filtered' : 'raw'}`);
+    const cur = { rec, chunks: [], startMs: Date.now(), session: S.session, seq: S.chunkSeq, filtered, reason: null };
+    S.chunkSeq++; saveSeq(S.session.id);
+    rec.ondataavailable = (e) => { if (e.data && e.data.size) cur.chunks.push(e.data); };
+    rec.onstop = () => finalizeChunk(cur);
+    S.cur = cur; S.rec = rec; S.chunkStartMs = cur.startMs;
+    rec.start();
+    setState('recording', `${S.session.id} · chunk #${cur.seq} · mic "${S.micLabel}"${filtered ? '' : ' · raw (no filter)'}`);
+    log(`chunk start #${cur.seq} ${filtered ? 'filtered' : 'raw'}`);
     render();
   }
-  function stopChunk(reason) { if (S.rec && S.rec.state === 'recording') { S.stopReason = reason; S.rec.stop(); } }
-  async function finalizeChunk() {
-    const endMs = Date.now(); const session = S.recSession; const seq = S.chunkSeq; const reason = S.stopReason || 'boundary';
-    const blob = new Blob(S.chunks, { type: (S.rec && S.rec.mimeType) || 'audio/webm' }); S.chunks = [];
-    const wasFiltered = S.recStream === (S.dest && S.dest.stream);
-    S.chunkSeq++;
-    if (!session || blob.size === 0) { log(`chunk #${seq} empty, dropped (${reason})`); }
+  function stopChunk(reason) { if (S.cur && S.cur.rec.state === 'recording') { S.cur.reason = reason; S.cur.rec.stop(); } }
+  async function finalizeChunk(cur) {
+    const endMs = Date.now(); const session = cur.session; const seq = cur.seq; const reason = cur.reason || 'boundary';
+    const blob = new Blob(cur.chunks, { type: cur.rec.mimeType || 'audio/webm' }); cur.chunks = [];
+    if (blob.size === 0) { log(`chunk #${seq} empty, dropped (${reason})`); }
     else {
       const sha = await sha256Hex(blob);
-      const shift = session.shift; const period = currentPeriod(shift, S.chunkStartMs);
+      const shift = session.shift; const period = currentPeriod(shift, cur.startMs);
       const manifest = {
         chunk_id: `${session.id}_${String(seq).padStart(3, '0')}`, session_id: session.id, seq,
-        started_at: isoLocal(S.chunkStartMs), ended_at: isoLocal(endMs), mic_label: S.micLabel, bytes: blob.size, sha256: sha,
-        page_version: C.PAGE_VERSION, hp_hz: wasFiltered ? C.HP_HZ : 0, mic_lost: reason === 'mic_lost', end_reason: reason,
+        started_at: isoLocal(cur.startMs), ended_at: isoLocal(endMs), mic_label: S.micLabel, bytes: blob.size, sha256: sha,
+        page_version: C.PAGE_VERSION, hp_hz: cur.filtered ? C.HP_HZ : 0, mic_lost: reason === 'mic_lost', end_reason: reason,
         campus_name: S.schedule.campus_name, cohort_code: shift.cohort_code, shift: shift.shift, timetabled: !!S.schedule.timetabled,
         period: period ? { subject: period.subject, mode: period.mode } : null, mime: blob.type, test: !!TEST
       };
       log(`chunk #${seq} done ${(blob.size / 1024).toFixed(0)} KB (${reason})`);
       await enqueue({ kind: 'chunk', id: manifest.chunk_id, session_id: session.id, manifest, blob });
     }
-    // keep going: same session, next chunk (unless the session ended or the mic is gone)
-    if (S.session === session && session && reason !== 'mic_lost' && reason !== 'session_end' && !S.stopping) startChunk();
+    // keep going: same session, next chunk (unless the session ended, the mic is gone, or another chunk already began)
+    if (S.session === session && S.cur === cur && reason !== 'mic_lost' && reason !== 'session_end' && !S.stopping) startChunk();
     render();
   }
   async function sha256Hex(blob) {
@@ -251,12 +265,36 @@
   }
 
   // ------------------------------------------------------------------ sessions and the tick (3.5, 3.6)
-  function beginSession(shift, ms) {
-    const p = localParts(ms);
-    S.session = { id: `${S.deviceId}_${p.date}_${shift.shift}${TEST ? 'T' : ''}`, shift, startedAt: ms };
-    S.chunkSeq = 0; S.levelsSeq = 0; S.levels = []; S.lastLevelsFlush = ms;
-    log(`session begin ${S.session.id} (${S.scheduleSource})`);
-    startChunk();
+  // Chunk and levels numbers per session, kept in localStorage so a reload mid-shift continues the numbering instead
+  // of restarting at 0 and replacing the recordings already made under those names (6 October 2026).
+  const seqKey = (sid) => 'obs_seq_' + sid;
+  function loadSeq(sid) {
+    try { const v = JSON.parse(localStorage.getItem(seqKey(sid))); if (v && Number.isInteger(v.chunk)) return v; } catch (_) {}
+    return { chunk: 0, levels: 0 };
+  }
+  function saveSeq(sid) { try { localStorage.setItem(seqKey(sid), JSON.stringify({ chunk: S.chunkSeq, levels: S.levelsSeq })); } catch (_) {} }
+  function forgetOtherDays(date) {
+    try { Object.keys(localStorage).filter(k => k.startsWith('obs_seq_') && !k.includes('_' + date + '_')).forEach(k => localStorage.removeItem(k)); } catch (_) {}
+  }
+  async function beginSession(shift, ms) {
+    const date = localParts(ms).date;
+    const id = `${S.deviceId}_${date}_${shift.shift}${TEST ? 'T' : ''}`;
+    S.session = { id, shift, startedAt: ms }; S.starting = true;              // set first: the next tick must not begin it twice
+    S.levels = []; S.lastLevelsFlush = ms;
+    // Continue after the highest number already used: the saved counter, or anything of this session still in the
+    // upload queue (a page older than this fix saved no counter).
+    const saved = loadSeq(id); let qChunk = -1, qLevels = 0;
+    try {
+      for (const i of await allItems()) {
+        if (i.session_id !== id) continue;
+        if (i.kind === 'chunk') qChunk = Math.max(qChunk, Number(i.manifest && i.manifest.seq));
+        if (i.kind === 'levels') qLevels = Math.max(qLevels, Number(String(i.id).slice(-4)) || 0);
+      }
+    } catch (_) {}
+    S.chunkSeq = Math.max(saved.chunk, qChunk + 1); S.levelsSeq = Math.max(saved.levels, qLevels);
+    saveSeq(id); forgetOtherDays(date); S.starting = false;
+    log(`session begin ${id} (${S.scheduleSource})${S.chunkSeq ? `, continuing at chunk #${S.chunkSeq}` : ''}`);
+    if (S.session && S.session.id === id) startChunk();
   }
   function endSession() {
     if (!S.session) return;
@@ -278,7 +316,7 @@
     if (shift && !S.session && S.stream && !S.micLost) beginSession(shift, now);
     if (!shift && !S.session && S.state !== 'no_mic') setState('waiting', `Next shift on the timetable. Mic "${S.micLabel || '–'}".`);
     if (S.session && S.rec && S.rec.state === 'recording' && now - S.chunkStartMs >= chunkMinutes() * 60000) stopChunk('boundary');
-    if (S.session && !S.rec && S.stream && !S.micLost) startChunk();
+    if (S.session && !S.rec && !S.starting && S.stream && !S.micLost) startChunk();
     flushLevels(false);
     if (now - S.lastStatus >= C.STATUS_EVERY_S * 1000) { S.lastStatus = now; sendStatus(); }
     pump();
@@ -361,5 +399,21 @@
     if (S.stream && S.state !== 'no_mic') setState('waiting', 'Ready. Recording starts on the timetable.');
     render();
   }
-  boot();
+
+  // One recorder per machine (6 October 2026). The Windows setup opens the page from the Startup folder and from
+  // Chrome's own startup page, so two tabs are likely, and two recorders would share one session's numbers and one
+  // upload queue. The first tab holds a Web Lock; any other tab waits on standby and takes over if the first closes.
+  if (navigator.locks) {
+    navigator.locks.request('observer-recorder', { ifAvailable: true }, async (lock) => {
+      if (lock) { await boot(); return new Promise(() => {}); }                // held for the life of the tab
+      setState('standby', 'Another Observer tab on this machine is recording. This tab takes over if that one closes.');
+      log('standby: another Observer tab holds the recorder');
+      return navigator.locks.request('observer-recorder', async () => {
+        log('the other tab closed; taking over');
+        await boot(); return new Promise(() => {});
+      });
+    });
+  } else {
+    boot();
+  }
 })();
