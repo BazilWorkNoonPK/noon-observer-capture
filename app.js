@@ -11,7 +11,7 @@
     schedule: null, scheduleFetchedAt: 0, scheduleSource: 'none',
     stream: null, track: null, micLabel: null, micHow: null, micDeviceId: null, micLost: false, reopenTimer: null,
     ctx: null, dest: null, ctxRunning: false,
-    rec: null, cur: null, chunkStartMs: 0, chunkSeq: 0, stopping: false, starting: false,
+    rec: null, cur: null, chunkStartMs: 0, chunkSeq: 0, stopping: false, starting: false, clockOffsetS: null,
     session: null,                      // { id, shift, cohort_code, periods, startedAt }
     levels: [], levelsSeq: 0, lastLevelsFlush: 0, lastStatus: 0, lastTick: 0,
     inFlight: false, lastUpload: null, queueDepth: 0, queueBytes: 0,
@@ -25,6 +25,7 @@
     const el = $('log'); if (el) { el.textContent = S.log.slice(-60).join('\n'); }
   }
   function setState(word, detail) {
+    if (word !== S.state && (word === 'no_mic' || word === 'error')) S.lastStatus = 0;   // a problem is reported at the next tick, not in ten minutes
     S.state = word; S.detail = detail || '';
     const el = $('stateWord'); el.className = 'state ' + word;
     el.textContent = { recording: 'Recording', waiting: 'Waiting for shift', no_mic: 'No USB mic', error: 'Error', starting: 'Starting', standby: 'Standby' }[word] || word;
@@ -97,8 +98,9 @@
     S.scheduleFetchedAt = Date.now();
     if (TEST) { S.schedule = defaultSchedule(); S.scheduleSource = `test ${TEST.minutes} min, chunks ${chunkMinutes()} min`; log(`TEST MODE: ${S.scheduleSource}`); render(); return; }
     try {
+      const sentAt = Date.now();
       const r = await fetch(`${ENDPOINT}?device=${encodeURIComponent(S.deviceId)}&token=${encodeURIComponent(S.token)}`, { redirect: 'follow' });
-      const j = await r.json();
+      const j = await r.json(); noteServerTime(j, sentAt);
       if (j && j.ok && j.shifts) { S.schedule = { campus_name: j.campus_name, timetabled: true, shifts: j.shifts }; S.scheduleSource = 'endpoint'; localStorage.setItem('obs_schedule', JSON.stringify(S.schedule)); log('schedule from endpoint'); render(); return; }
       log(`schedule refused: ${j && j.reason}`);
     } catch (e) { log(`schedule fetch failed: ${e.message}`); }
@@ -145,7 +147,8 @@
       S.track.onended = onMicLost;
       log(`mic open: "${S.micLabel}" via ${S.micHow}; ${JSON.stringify(S.track.getSettings())}`);
       await buildGraph();
-      if (!usb) setState('no_mic', `Recording from "${S.micLabel}" because no USB mic was found.`);
+      if (!usb) setState('no_mic', S.session ? `Recording from "${S.micLabel}" because no USB mic was found.`
+                                              : `No USB mic found. "${S.micLabel}" would be used if a shift started now.`);
       render();
       return true;
     } catch (e) {
@@ -233,7 +236,11 @@
     rec.onstop = () => finalizeChunk(cur);
     S.cur = cur; S.rec = rec; S.chunkStartMs = cur.startMs;
     rec.start();
-    setState('recording', `${S.session.id} · chunk #${cur.seq} · mic "${S.micLabel}"${filtered ? '' : ' · raw (no filter)'}`);
+    // Recording from anything but the USB mic stays flagged as no_mic, so the heartbeat and the coverage line show it.
+    const fallback = S.micHow !== 'USB name' && S.micHow !== 'fake';
+    setState(fallback ? 'no_mic' : 'recording', fallback
+      ? `Recording from "${S.micLabel}" because no USB mic was found. ${S.session.id} · chunk #${cur.seq}`
+      : `${S.session.id} · chunk #${cur.seq} · mic "${S.micLabel}"${filtered ? '' : ' · raw (no filter)'}`);
     log(`chunk start #${cur.seq} ${filtered ? 'filtered' : 'raw'}`);
     render();
   }
@@ -249,6 +256,7 @@
         chunk_id: `${session.id}_${String(seq).padStart(3, '0')}`, session_id: session.id, seq,
         started_at: isoLocal(cur.startMs), ended_at: isoLocal(endMs), mic_label: S.micLabel, bytes: blob.size, sha256: sha,
         page_version: C.PAGE_VERSION, hp_hz: cur.filtered ? C.HP_HZ : 0, mic_lost: reason === 'mic_lost', end_reason: reason,
+        device_clock_offset_s: S.clockOffsetS,
         campus_name: S.schedule.campus_name, cohort_code: shift.cohort_code, shift: shift.shift, timetabled: !!S.schedule.timetabled,
         period: period ? { subject: period.subject, mode: period.mode } : null, mime: blob.type, test: !!TEST
       };
@@ -318,7 +326,9 @@
     if (S.session && S.rec && S.rec.state === 'recording' && now - S.chunkStartMs >= chunkMinutes() * 60000) stopChunk('boundary');
     if (S.session && !S.rec && !S.starting && S.stream && !S.micLost) startChunk();
     flushLevels(false);
-    if (now - S.lastStatus >= C.STATUS_EVERY_S * 1000) { S.lastStatus = now; sendStatus(); }
+    // A heartbeat each minute during a shift, every ten minutes outside one: an all-day page made 1,440 files a day.
+    const every = (S.session ? C.STATUS_EVERY_S : C.STATUS_IDLE_EVERY_S) * 1000;
+    if (now - S.lastStatus >= every) { S.lastStatus = now; sendStatus(); }
     pump();
   }
 
@@ -327,9 +337,20 @@
     if (!S.deviceId) return;
     const body = { kind: 'status', device_id: S.deviceId, token: S.token, at: isoLocal(Date.now()), state: S.state,
                    mic_label: S.micLabel, queue_depth: S.queueDepth, queue_bytes: S.queueBytes, page_version: C.PAGE_VERSION,
-                   session_id: S.session ? S.session.id : null, detail: S.detail, hidden: document.hidden, ctx_running: S.ctxRunning };
-    try { await fetch(ENDPOINT, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'text/plain' }, redirect: 'follow' }); }
-    catch (_) { /* status is best effort; the next one comes in a minute */ }
+                   session_id: S.session ? S.session.id : null, detail: S.detail, hidden: document.hidden, ctx_running: S.ctxRunning,
+                   schedule_source: S.scheduleSource, clock_offset_s: S.clockOffsetS };
+    try {
+      const sentAt = Date.now();
+      const r = await fetch(ENDPOINT, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'text/plain' }, redirect: 'follow' });
+      noteServerTime(await r.json(), sentAt);
+    } catch (_) { /* status is best effort; the next one comes at the next interval */ }
+  }
+  // The laptop's clock against the endpoint's (6 October 2026). Sessions are named and timed by the laptop's clock, and
+  // a refurbished laptop's can be wrong; the offset travels in every manifest and heartbeat so the error is visible.
+  function noteServerTime(j, sentAt) {
+    const server = j && Date.parse(j.server_time);
+    if (!isFinite(server)) return;
+    S.clockOffsetS = Math.round((server - (sentAt + Date.now()) / 2) / 1000);
   }
 
   // ------------------------------------------------------------------ queue (3.7): IndexedDB, oldest first, one in flight
@@ -356,19 +377,28 @@
   async function allItems() { return tx('readonly', st => st.getAll()); }
   async function oldestItem(pred) { const items = (await allItems()).filter(pred || (() => true)).sort((a, b) => a.created - b.created); return items[0] || null; }
   async function refreshQueueStats() { const items = await allItems(); S.queueDepth = items.length; S.queueBytes = items.reduce((n, i) => n + (i.blob ? i.blob.size : JSON.stringify(i).length), 0); }
+  // A refusal (the endpoint answered and said no, e.g. bad_token or sha_mismatch) is kept and retried hourly; a
+  // temporary failure (no network, no answer, an answer that is not JSON, a reason starting write_failed or
+  // config_error) within minutes, up to BACKOFF_CAP_S. In 0.1.1 every refusal but bad_token was retried every ten
+  // minutes for ever, re-sending a 20-minute recording ~144 times a day over the campus link (6 October 2026).
+  const TEMPORARY = /^(write_failed|config_error|server_error)/;
   async function pump() {
     if (S.inFlight || !S.db || !navigator.onLine) return;
     if (!C.UPLOAD_DURING_CLASS && S.session) return;
-    const now = Date.now();
-    const item = await oldestItem(i => (i.next_at || 0) <= now); if (!item) return;
     S.inFlight = true;
     try {
-      const ack = await postItem(item);
-      if (ack && ack.ok) { await tx('readwrite', st => st.delete(item.id)); S.lastUpload = `${item.id} at ${new Date().toTimeString().slice(0, 8)}`; log(`uploaded ${item.id}`); }
-      else if (ack && ack.reason === 'bad_token') { log(`endpoint refused ${item.id}: bad token; keeping it, check devices.json`); await defer(item, 3600); }
-      else { await defer(item, null, ack && ack.reason); }
-    } catch (e) { await defer(item, null, e.message); }
-    S.inFlight = false; await refreshQueueStats(); render();
+      const now = Date.now();
+      const item = await oldestItem(i => (i.next_at || 0) <= now);
+      if (item) {
+        let ack = null, why = null;
+        try { ack = await postItem(item); } catch (e) { why = e.message; }
+        if (ack && ack.ok) { await tx('readwrite', st => st.delete(item.id)); S.lastUpload = `${item.id} at ${new Date().toTimeString().slice(0, 8)}`; log(`uploaded ${item.id}`); }
+        else if (ack && ack.reason && !TEMPORARY.test(ack.reason)) { log(`endpoint refused ${item.id}: ${ack.reason}; kept, tried again hourly`); await defer(item, C.REFUSED_RETRY_S, ack.reason); }
+        else { await defer(item, null, why || (ack && ack.reason) || 'no answer'); }
+        await refreshQueueStats(); render();
+      }
+    } catch (e) { log(`queue error: ${e.message}`); }
+    finally { S.inFlight = false; }                     // never left set: a stuck flag would stop every upload
   }
   async function defer(item, seconds, why) {
     item.attempts = (item.attempts || 0) + 1;
@@ -381,8 +411,10 @@
     const body = { kind: item.kind, device_id: S.deviceId, token: S.token, id: item.id, session_id: item.session_id };
     if (item.kind === 'chunk') { body.manifest = item.manifest; body.audio_b64 = await blobToBase64(item.blob); }
     if (item.kind === 'levels') { body.rows = item.rows; }
+    const sentAt = Date.now();
     const r = await fetch(ENDPOINT, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'text/plain' }, redirect: 'follow' });
-    return r.json();
+    const j = await r.json(); noteServerTime(j, sentAt);
+    return j;
   }
   function blobToBase64(blob) { return new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(String(fr.result).split(',')[1]); fr.onerror = () => rej(fr.error); fr.readAsDataURL(blob); }); }
 

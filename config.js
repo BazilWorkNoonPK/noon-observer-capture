@@ -1,10 +1,10 @@
 // Observer capture page - configuration. Plain constants; no secrets. Every number here is PROVISIONAL
 // (observer/CLAUDE.md rule 6) and is reported in the pilot report. Decisions: Noon_Qalam_Decisions_2026-09-24_Observer.md.
 window.OBS_CONFIG = {
-  PAGE_VERSION: 'capture@0.1.1',
+  PAGE_VERSION: 'capture@0.1.2',
 
   // Where chunks, levels and status go. The Apps Script web app URL (endpoint/README.md). Set at deploy time.
-  ENDPOINT_URL: 'https://script.google.com/macros/s/AKfycby2SsJmqh99krANRgVxgte3EN2sPTFUi3o3fLhfiMGkCbnvwBg2atMij0L2S4EbQczZ/exec',   // deployed 3 October 2026, Observer endpoint v1
+  ENDPOINT_URL: 'https://script.google.com/macros/s/AKfycby2SsJmqh99krANRgVxgte3EN2sPTFUi3o3fLhfiMGkCbnvwBg2atMij0L2S4EbQczZ/exec',   // deployed 3 October 2026; every new version of the script keeps this address
 
   // Recording (DESIGN 3.3, 3.4). O14: 20-minute chunks. HP_HZ: high-pass before metering and recording (P0: 50 Hz mains hum).
   CHUNK_MINUTES: 20,
@@ -26,7 +26,9 @@ window.OBS_CONFIG = {
   BACKOFF_BASE_S: 30,
   BACKOFF_CAP_S: 600,
   QUEUE_CAP_BYTES: 150 * 1024 * 1024,   // ~3 days of audio; beyond it the oldest chunk is dropped and logged
-  STATUS_EVERY_S: 60,
+  STATUS_EVERY_S: 60,            // a heartbeat each minute during a shift
+  STATUS_IDLE_EVERY_S: 600,      // and every ten minutes outside one (0.1.2)
+  REFUSED_RETRY_S: 3600,         // an upload the endpoint refused is kept and tried again hourly (0.1.2)
   LEVELS_BATCH_S: 60,
 
   // Clock (DESIGN 3.6). The worker ticks every second; the page derives state from the clock, never from "a timer fired".
